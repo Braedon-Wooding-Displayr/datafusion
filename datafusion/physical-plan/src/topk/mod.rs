@@ -34,7 +34,7 @@ use super::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory,
     RecordOutput,
 };
-use crate::spill::get_record_batch_memory_size;
+use crate::spill::{gc_view_arrays, get_record_batch_memory_size};
 use crate::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 
 use arrow::array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
@@ -1077,6 +1077,9 @@ impl TopKHeap {
         let Some(new_batch) = new_batch else {
             return Ok(());
         };
+        // Interleaved view columns still reference every source batch's data
+        // buffers, so copy out the bytes the retained rows use.
+        let new_batch = gc_view_arrays(&new_batch)?;
 
         // clear all old entries in store (this invalidates all
         // store_ids in `inner`)
@@ -3204,7 +3207,7 @@ mod tests {
     use crate::metrics::MetricValue;
     use arrow::array::{
         AsArray, BooleanArray, Float64Array, Int32Array, StringArray,
-        StringDictionaryBuilder,
+        StringDictionaryBuilder, StringViewArray,
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema, UInt64Type};
     use arrow_schema::SortOptions;
@@ -4025,6 +4028,73 @@ mod tests {
             &results
         );
 
+        Ok(())
+    }
+
+    /// Compaction must release the data buffers of view columns, not only the
+    /// rows: an interleaved view still points into its source batch's buffer.
+    #[tokio::test]
+    async fn test_topk_memory_compaction_releases_view_buffers() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("a", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let full_expr = LexOrdering::from([sort_expr.clone()]);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let k = 5;
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![sort_expr],
+            full_expr,
+            k,
+            8192,
+            Arc::new(RuntimeEnv::default()),
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+
+        // The last row of batch `b` holds `a = b`, so the top 5 come from five
+        // different batches, each pointing into its batch's last data buffer.
+        let rows = 8192;
+        for b in 0..k as i32 {
+            let a: ArrayRef = Arc::new(Int32Array::from_iter_values(
+                (0..rows).map(|row| (rows - 1 - row) * k as i32 + b),
+            ));
+            let s: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+                (0..rows).map(|row| format!("batch {b:02} row {row:05} padding to 32")),
+            ));
+            topk.insert_batch(RecordBatch::try_new(Arc::clone(&schema), vec![a, s])?)?;
+        }
+
+        assert_eq!(topk.heap.store.len(), 1, "store should be compacted");
+        let retained = topk.heap.store.size();
+        assert!(
+            retained < 16 * 1024,
+            "{retained} bytes retained for {k} rows of 33-byte strings"
+        );
+
+        let results: Vec<_> = topk.emit()?.try_collect().await?;
+        assert_batches_eq!(
+            &[
+                "+---+----------------------------------+",
+                "| a | s                                |",
+                "+---+----------------------------------+",
+                "| 0 | batch 00 row 08191 padding to 32 |",
+                "| 1 | batch 01 row 08191 padding to 32 |",
+                "| 2 | batch 02 row 08191 padding to 32 |",
+                "| 3 | batch 03 row 08191 padding to 32 |",
+                "| 4 | batch 04 row 08191 padding to 32 |",
+                "+---+----------------------------------+",
+            ],
+            &results
+        );
         Ok(())
     }
 

@@ -1274,7 +1274,9 @@ impl RecordBatchStore {
             return Ok(());
         }
         let gather_idx = UInt32Array::from_iter_values(rows.iter().copied());
-        let mut entry = self.register(take_record_batch(batch, &gather_idx)?);
+        // A gathered view still points into `batch`'s data buffers.
+        let gathered = gc_view_arrays(&take_record_batch(batch, &gather_idx)?)?;
+        let mut entry = self.register(gathered);
         debug_assert_eq!(
             entry.id, id,
             "the id handed to the slots must be the id the gather got"
@@ -1441,8 +1443,10 @@ impl RecordBatchStore {
                 Vec::with_capacity(coords.len().div_ceil(batch_size));
             let mut remap = vec![usize::MAX; old.len()];
             for chunk in coords.chunks(batch_size) {
-                chunks
-                    .push((interleave_referenced(&old, chunk, &mut remap)?, chunk.len()));
+                // As in `TopKHeap::maybe_compact`: free the view buffers too.
+                let batch =
+                    gc_view_arrays(&interleave_referenced(&old, chunk, &mut remap)?)?;
+                chunks.push((batch, chunk.len()));
             }
             chunks
         };
@@ -5192,6 +5196,79 @@ mod tests {
         // reaches that path at all.
         let expected: Vec<(i32, i32)> = (0..B).map(|pk| (pk, 0)).collect();
         assert_eq!(pk_val_rows(state.emit()?).await?, expected);
+        Ok(())
+    }
+
+    /// A partitioned top-k must not keep its input's view data buffers alive,
+    /// whether it retains a few rows of a batch or compacts many down to a few.
+    #[tokio::test]
+    async fn test_partitioned_topk_releases_view_buffers() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let pk_expr: Arc<dyn PhysicalExpr> = col("pk", schema.as_ref())?;
+        let pk_sort_expr = PhysicalSortExpr {
+            expr: Arc::clone(&pk_expr),
+            options: SortOptions::default(),
+        };
+        let val_sort_expr = PhysicalSortExpr {
+            expr: col("val", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+        let k = 5;
+        let mut state = PartitionedTopK::try_new(
+            0,
+            &schema,
+            vec![pk_expr],
+            build_sort_fields(&[pk_sort_expr], &schema)?,
+            LexOrdering::from([val_sort_expr]),
+            k,
+            8192,
+            &Arc::new(RuntimeEnv::default()),
+            &ExecutionPlanMetricsSet::new(),
+            None,
+        )?;
+
+        // One partition; the last row of batch `b` holds `val = b`, so the top
+        // 5 come from five different batches' last data buffers.
+        let rows = 8192;
+        for b in 0..k as i32 {
+            let pk: ArrayRef = Arc::new(Int32Array::from(vec![0; rows as usize]));
+            let val: ArrayRef = Arc::new(Int32Array::from_iter_values(
+                (0..rows).map(|row| (rows - 1 - row) * k as i32 + b),
+            ));
+            let s: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+                (0..rows).map(|row| format!("batch {b:02} row {row:05} padding to 32")),
+            ));
+            state.insert_batch(&RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![pk, val, s],
+            )?)?;
+        }
+
+        let retained = state.core.store.size();
+        assert!(
+            retained < 16 * 1024,
+            "{retained} bytes retained for {k} rows of 33-byte strings"
+        );
+
+        let results: Vec<_> = state.emit()?.try_collect().await?;
+        assert_batches_eq!(
+            &[
+                "+----+-----+----------------------------------+",
+                "| pk | val | s                                |",
+                "+----+-----+----------------------------------+",
+                "| 0  | 0   | batch 00 row 08191 padding to 32 |",
+                "| 0  | 1   | batch 01 row 08191 padding to 32 |",
+                "| 0  | 2   | batch 02 row 08191 padding to 32 |",
+                "| 0  | 3   | batch 03 row 08191 padding to 32 |",
+                "| 0  | 4   | batch 04 row 08191 padding to 32 |",
+                "+----+-----+----------------------------------+",
+            ],
+            &results
+        );
         Ok(())
     }
 
